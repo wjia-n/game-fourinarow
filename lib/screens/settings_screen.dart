@@ -360,6 +360,16 @@ class _NameRow extends StatelessWidget {
           onPressed: () async {
             final ctl =
                 TextEditingController(text: settings.playerNames[side]);
+            final focus = FocusNode();
+            var cancelled = false;
+            // Focus-loss commit: if the field loses focus (e.g. user taps
+            // away) without pressing Save/Cancel, commit what's typed so the
+            // rename is never lost. Cancelled dialogs commit nothing.
+            focus.addListener(() {
+              if (!focus.hasFocus && !cancelled) {
+                settings.setPlayerName(side, ctl.text);
+              }
+            });
             final result = await showDialog<String>(
               context: context,
               builder: (ctx) => AlertDialog(
@@ -368,6 +378,7 @@ class _NameRow extends StatelessWidget {
                     style: F4Text.mono(16, color: theme.ivory)),
                 content: TextField(
                   controller: ctl,
+                  focusNode: focus,
                   autofocus: true,
                   maxLength: 14,
                   style: F4Text.mono(16, color: theme.ivory),
@@ -381,22 +392,37 @@ class _NameRow extends StatelessWidget {
                         borderSide:
                             BorderSide(color: theme.accentLight, width: 2)),
                   ),
+                  // Save-on-keystroke: every keystroke persists immediately.
+                  onChanged: (v) => settings.setPlayerName(side, v),
+                  // Keyboard-done commits too.
+                  onSubmitted: (v) {
+                    cancelled = true; // Save path handles the commit.
+                    Navigator.of(ctx).pop(v);
+                  },
                 ),
                 actions: [
                   TextButton(
-                    onPressed: () => Navigator.of(ctx).pop(),
+                    onPressed: () {
+                      cancelled = true;
+                      Navigator.of(ctx).pop();
+                    },
                     child: Text('Cancel',
                         style: F4Text.mono(14,
                             color: theme.ivory.withValues(alpha: 0.6))),
                   ),
                   TextButton(
-                    onPressed: () => Navigator.of(ctx).pop(ctl.text),
+                    onPressed: () {
+                      cancelled = true; // Save path handles the commit.
+                      Navigator.of(ctx).pop(ctl.text);
+                    },
                     child: Text('Save',
                         style: F4Text.mono(14, color: theme.accentLight)),
                   ),
                 ],
               ),
             );
+            ctl.dispose();
+            focus.dispose();
             if (result != null) {
               audio.click();
               await settings.setPlayerName(side, result);
