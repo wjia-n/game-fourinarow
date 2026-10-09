@@ -1,52 +1,35 @@
-import 'dart:async';
-import 'dart:convert';
 import 'dart:math';
 
 import 'package:flutter/material.dart';
-import 'package:shared_preferences/shared_preferences.dart';
+import 'package:flutter/services.dart';
 
-import '../ai.dart';
-import '../audio.dart';
 import '../engine.dart';
-import '../settings.dart';
-import '../theme.dart';
+import '../match_engine.dart';
+import '../services/audio_service.dart';
+import '../services/settings_service.dart';
+import '../theme/arcade_themes.dart';
+import '../theme/arcade_widgets.dart';
+import '../theme/themed_widgets.dart';
+import 'settings_screen.dart';
 
-/// Game board screen: status plaque, chrome column selectors, 7x6 grid toy,
-/// score plaque. Owns the engine, bot turns, animations and persistence.
+/// Match screen: per-side player trays, status plaque, chrome column
+/// selectors, 7×6 grid toy, score plaque. Renders the [F4Match] — the engine
+/// owns ALL turn state; this screen never advances the game itself.
 class GameScreen extends StatefulWidget {
+  final F4Audio audio;
+  final F4Settings settings;
   final int mode; // 0 = vs bot, 1 = 2 players
   final int difficulty;
   final Map<String, dynamic>? restored;
-  final VoidCallback onExitToMenu;
-  final VoidCallback onOpenSettings;
 
   const GameScreen({
     super.key,
+    required this.audio,
+    required this.settings,
     required this.mode,
     required this.difficulty,
     this.restored,
-    required this.onExitToMenu,
-    required this.onOpenSettings,
   });
-
-  static const saveKey = 'fir_save_v1';
-
-  static Future<void> clearSave() async {
-    (await SharedPreferences.getInstance()).remove(saveKey);
-  }
-
-  static Future<Map<String, dynamic>?> loadSave() async {
-    final raw = (await SharedPreferences.getInstance()).getString(saveKey);
-    if (raw == null) return null;
-    try {
-      final m = jsonDecode(raw) as Map<String, dynamic>;
-      final eng = FourInARowEngine()..fromJson(m['engine'] as Map<String, dynamic>);
-      if (eng.over || eng.history.isEmpty) return null;
-      return m;
-    } catch (_) {
-      return null;
-    }
-  }
 
   @override
   State<GameScreen> createState() => _GameScreenState();
@@ -54,318 +37,336 @@ class GameScreen extends StatefulWidget {
 
 class _GameScreenState extends State<GameScreen>
     with TickerProviderStateMixin, WidgetsBindingObserver {
-  final engine = FourInARowEngine();
-  final s = F4Settings.instance;
-  final audio = F4Audio.instance;
+  late final F4Match match;
 
-  bool _botThinking = false;
-  bool _paused = false;
-  bool _showGameOver = false;
-  int? _pendingBotCol; // bot finished while paused
+  // Falling-disc animation (driven by match.animCol/animRow).
+  late final AnimationController _fallCtl;
+  bool _fallRunning = false;
 
-  // drop animation
-  late final AnimationController _dropCtl;
-  int _animCol = -1, _animRow = -1, _animPlayer = -1;
-  bool get _animating => _animCol != -1;
-
-  // invalid-column shake
-  int _shakeCol = -1;
+  // Invalid-column shake.
   late final AnimationController _shakeCtl;
+  int _shakeCol = -1;
+
+  F4Settings get s => widget.settings;
+  F4ArcadeThemeDef get t =>
+      F4ArcadeThemes.byId(s.themeId, custom: s.customTheme);
 
   @override
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
-    if (widget.restored != null) {
-      engine.fromJson(widget.restored!['engine'] as Map<String, dynamic>);
-    }
-    _dropCtl = AnimationController(
+    _fallCtl = AnimationController(
       vsync: this,
-      duration: const Duration(milliseconds: 420),
-    )..addStatusListener((st) {
-        if (st == AnimationStatus.completed) _onDropLanded();
-      });
+      duration: Duration(milliseconds: F4Match.dropDurationMs - 80),
+    );
     _shakeCtl = AnimationController(
       vsync: this,
       duration: const Duration(milliseconds: 320),
-    )..addStatusListener((st) {
-        if (st == AnimationStatus.completed) {
-          setState(() => _shakeCol = -1);
-        }
-      });
-    audio.playMusic('audio/music_game.wav');
-    _persist();
-    WidgetsBinding.instance.addPostFrameCallback((_) => _maybeBot());
+    );
+    match = F4Match(
+      settings: s,
+      audio: widget.audio,
+      mode: widget.mode,
+      difficulty: widget.difficulty,
+      restored: widget.restored,
+    );
+    match.addListener(_onMatch);
   }
 
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
-    _dropCtl.dispose();
+    match.removeListener(_onMatch);
+    match.dispose();
+    _fallCtl.dispose();
     _shakeCtl.dispose();
     super.dispose();
+  }
+
+  void _onMatch() {
+    if (!mounted) return;
+    // Kick the falling-disc animation when a drop starts.
+    if (match.animCol != -1 && !_fallRunning) {
+      _fallRunning = true;
+      _fallCtl.forward(from: 0).whenComplete(() {
+        _fallRunning = false;
+      });
+    }
+    // Kick the invalid-column shake.
+    if (match.shakeCol != -1 && _shakeCol == -1) {
+      _shakeCol = match.shakeCol;
+      _shakeCtl.forward(from: 0).whenComplete(() {
+        _shakeCol = -1;
+        match.clearShake();
+      });
+    }
+    setState(() {});
   }
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
     if (state == AppLifecycleState.paused ||
         state == AppLifecycleState.inactive) {
-      _persist();
+      match.setPaused(true);
+      widget.audio.onAppPaused();
+    } else if (state == AppLifecycleState.resumed) {
+      widget.audio.onAppResumed();
+      match.setPaused(false);
     }
   }
 
-  // -- persistence -----------------------------------------------------------
-  Future<void> _persist() async {
-    if (engine.over) return;
-    final p = await SharedPreferences.getInstance();
-    await p.setString(
-      GameScreen.saveKey,
-      jsonEncode({
-        'mode': widget.mode,
-        'difficulty': widget.difficulty,
-        'engine': engine.toJson(),
-      }),
+  Future<void> _rename(int side) async {
+    final ctl = TextEditingController(text: s.playerNames[side]);
+    final result = await showDialog<String>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: t.woodMid,
+        title: Text('Rename player',
+            style: F4Text.mono(16, color: t.ivory)),
+        content: TextField(
+          controller: ctl,
+          autofocus: true,
+          maxLength: 14,
+          style: F4Text.mono(16, color: t.ivory),
+          decoration: InputDecoration(
+            hintText: F4Settings.defaultNames[side],
+            hintStyle: F4Text.body.copyWith(
+                color: t.ivory.withValues(alpha: 0.4)),
+            enabledBorder: UnderlineInputBorder(
+                borderSide: BorderSide(color: t.accent)),
+            focusedBorder: UnderlineInputBorder(
+                borderSide: BorderSide(color: t.accentLight, width: 2)),
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(),
+            child: Text('Cancel',
+                style: F4Text.mono(14, color: t.ivory.withValues(alpha: 0.6))),
+          ),
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(ctl.text),
+            child:
+                Text('Save', style: F4Text.mono(14, color: t.accentLight)),
+          ),
+        ],
+      ),
+    );
+    if (result != null) {
+      widget.audio.click();
+      await s.setPlayerName(side, result);
+    }
+  }
+
+  void _openSettings() {
+    widget.audio.click();
+    match.setPaused(true);
+    Navigator.of(context)
+        .push(MaterialPageRoute(
+            builder: (_) => SettingsScreen(
+                audio: widget.audio, settings: s)))
+        .then((_) => match.setPaused(false));
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = t;
+    return Scaffold(
+      backgroundColor: theme.woodDeep,
+      body: F4WoodBackdrop(
+        theme: theme,
+        child: SafeArea(
+          child: ListenableBuilder(
+            listenable: match,
+            builder: (_, _) => Stack(
+              children: [
+                _body(theme),
+                if (match.paused && match.phase != F4Phase.over)
+                  _pauseOverlay(theme),
+                if (match.phase == F4Phase.over) _gameOverOverlay(theme),
+              ],
+            ),
+          ),
+        ),
+      ),
     );
   }
 
-  // -- moves -----------------------------------------------------------------
-  bool get _inputLocked =>
-      _animating || _botThinking || _paused || _showGameOver || engine.over;
-
-  bool get _isBotTurn =>
-      widget.mode == 0 && engine.turn == 1 && !engine.over;
-
-  void _tapColumn(int c) {
-    if (_inputLocked || _isBotTurn) return;
-    final r = engine.dropRow(c);
-    if (r == -1) {
-      // illegal: full column — rejected, turn stays (RULES.md §5, §12)
-      audio.invalid();
-      setState(() => _shakeCol = c);
-      _shakeCtl.forward(from: 0);
-      return;
-    }
-    _commitMove(c, r);
-  }
-
-  void _commitMove(int c, int r) {
-    final mover = engine.turn;
-    engine.play(c); // always legal here
-    setState(() {
-      _animCol = c;
-      _animRow = r;
-      _animPlayer = mover;
-    });
-    _dropCtl.forward(from: 0);
-    // wooden tok as the disc lands
-    Future.delayed(const Duration(milliseconds: 300), () {
-      if (_animating && mounted) audio.drop();
-    });
-  }
-
-  void _onDropLanded() {
-    setState(() {
-      _animCol = -1;
-      _animRow = -1;
-      _animPlayer = -1;
-    });
-    if (engine.over) {
-      _onGameOver();
-    } else {
-      _persist();
-      _maybeBot();
-    }
-  }
-
-  void _maybeBot() {
-    if (!_isBotTurn || _inputLocked) return;
-    setState(() => _botThinking = true);
-    // small beat so the "thinking" hardware feels alive
-    Future.delayed(const Duration(milliseconds: 450), () async {
-      if (!mounted || engine.over) {
-        if (mounted) setState(() => _botThinking = false);
-        return;
-      }
-      final col = await Bot.choose(
-        engine.cells,
-        engine.turn,
-        widget.difficulty,
-      );
-      if (!mounted) return;
-      setState(() => _botThinking = false);
-      if (engine.over) return;
-      if (_paused) {
-        _pendingBotCol = col; // hold until resume
-        return;
-      }
-      _applyBotMove(col);
-    });
-  }
-
-  void _applyBotMove(int col) {
-    if (col < 0 || engine.dropRow(col) == -1) {
-      // defensive: bot never plays illegal columns; fall back gracefully
-      final legal = engine.legalMoves();
-      if (legal.isEmpty) return;
-      col = legal.first;
-    }
-    _commitMove(col, engine.dropRow(col));
-  }
-
-  Future<void> _onGameOver() async {
-    await GameScreen.clearSave();
-    final mode = widget.mode;
-    if (engine.isDraw) {
-      await s.recordResult(mode, -1);
-      audio.start();
-    } else if (engine.winner == 0) {
-      await s.recordResult(mode, 0);
-      audio.win();
-    } else {
-      await s.recordResult(mode, 1);
-      audio.lose();
-    }
-    await Future.delayed(const Duration(milliseconds: 750));
-    if (mounted) setState(() => _showGameOver = true);
-  }
-
-  // -- controls --------------------------------------------------------------
-  void _restart() {
-    audio.start();
-    engine.reset();
-    setState(() {
-      _showGameOver = false;
-      _paused = false;
-      _pendingBotCol = null;
-      _botThinking = false;
-    });
-    _persist();
-    _maybeBot();
-  }
-
-  void _undo() {
-    // 2-players only: remove the last two plies (RULES.md §12).
-    if (widget.mode != 1 || engine.over || _inputLocked) return;
-    if (engine.history.length < 2) return;
-    audio.click();
-    engine.undoPly();
-    engine.undoPly();
-    setState(() {});
-    _persist();
-  }
-
-  void _togglePause() {
-    if (engine.over || _showGameOver) return;
-    audio.click();
-    setState(() => _paused = !_paused);
-    if (!_paused && _pendingBotCol != null) {
-      final c = _pendingBotCol!;
-      _pendingBotCol = null;
-      _applyBotMove(c);
-    } else if (!_paused) {
-      _maybeBot();
-    }
-  }
-
-  // -- build -----------------------------------------------------------------
-  @override
-  Widget build(BuildContext context) {
-    return SafeArea(
-      child: Stack(
+  Widget _body(F4ArcadeThemeDef theme) {
+    final turn = match.engine.turn;
+    final inputOpen = match.phase == F4Phase.awaitingDrop &&
+        !match.currentIsBot &&
+        !match.paused;
+    return SingleChildScrollView(
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+      child: Column(
         children: [
-          Column(
-            children: [
-              _statusPlaque(),
-              const SizedBox(height: 10),
-              Expanded(child: _boardPanel()),
-              const SizedBox(height: 10),
-              _scorePlaque(),
-              const SizedBox(height: 8),
-            ],
+          // Top tray — Yellow side.
+          PlayerTray(
+            side: 1,
+            name: s.playerNames[1],
+            isBot: match.isBot[1],
+            active: turn == 1 && !match.engine.over,
+            thinking: turn == 1 && match.phase == F4Phase.thinking,
+            theme: theme,
+            discStyle: s.discStyle,
+            onRename: () => _rename(1),
           ),
-          if (_paused) _pauseOverlay(),
-          if (_showGameOver) _gameOverOverlay(),
+          const SizedBox(height: 10),
+          // Status plaque: banner + controls.
+          IronPanel(
+            child: Column(
+              children: [
+                AnimatedSwitcher(
+                  duration: const Duration(milliseconds: 200),
+                  child: Text(
+                    match.banner,
+                    key: ValueKey(match.banner),
+                    style: F4Text.mono(14, color: theme.ivory),
+                    textAlign: TextAlign.center,
+                  ),
+                ),
+                const SizedBox(height: 8),
+                Row(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  children: [
+                    _IconStud(
+                      icon: Icons.undo,
+                      theme: theme,
+                      enabled: widget.mode == 1 &&
+                          match.phase == F4Phase.awaitingDrop &&
+                          match.engine.history.isNotEmpty,
+                      onTap: match.undo,
+                    ),
+                    const SizedBox(width: 10),
+                    _IconStud(
+                      icon: Icons.refresh,
+                      theme: theme,
+                      enabled: true,
+                      onTap: () {
+                        widget.audio.click();
+                        match.newGame();
+                      },
+                    ),
+                    const SizedBox(width: 10),
+                    _IconStud(
+                      icon: Icons.pause,
+                      theme: theme,
+                      enabled: true,
+                      onTap: () {
+                        widget.audio.click();
+                        match.setPaused(true);
+                      },
+                    ),
+                    const SizedBox(width: 10),
+                    _IconStud(
+                      icon: Icons.settings,
+                      theme: theme,
+                      enabled: true,
+                      onTap: _openSettings,
+                    ),
+                    const SizedBox(width: 10),
+                    _IconStud(
+                      icon: Icons.home,
+                      theme: theme,
+                      enabled: true,
+                      onTap: () {
+                        widget.audio.click();
+                        match.save();
+                        Navigator.of(context).pop();
+                      },
+                    ),
+                  ],
+                ),
+              ],
+            ),
+          ),
+          const SizedBox(height: 10),
+          // Chrome column selectors.
+          _columnSelectors(theme, inputOpen),
+          const SizedBox(height: 6),
+          // Board.
+          _board(theme),
+          const SizedBox(height: 10),
+          // Bottom tray — Red side.
+          PlayerTray(
+            side: 0,
+            name: s.playerNames[0],
+            isBot: match.isBot[0],
+            active: turn == 0 && !match.engine.over,
+            thinking: turn == 0 && match.phase == F4Phase.thinking,
+            theme: theme,
+            discStyle: s.discStyle,
+            onRename: () => _rename(0),
+          ),
+          const SizedBox(height: 10),
+          _scorePlaque(theme),
+          const SizedBox(height: 8),
         ],
       ),
     );
   }
 
-  Widget _statusPlaque() {
-    final turnLabel = _isBotTurn && _botThinking
-        ? 'BOT THINKING'
-        : widget.mode == 0
-            ? (engine.turn == 0 ? 'YOUR TURN' : 'BOT TURN')
-            : (engine.turn == 0 ? 'RED TO MOVE' : 'YELLOW TO MOVE');
-    return Padding(
-      padding: const EdgeInsets.fromLTRB(16, 8, 16, 0),
-      child: IronPanel(
-        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-        child: Row(
-          children: [
-            AcrylicDisc(player: engine.turn, size: 30),
-            const SizedBox(width: 10),
-            Expanded(
-              child: _isBotTurn && _botThinking
-                  ? const _ThinkingDots()
-                  : Text(turnLabel, style: F4Text.mono(15, color: F4Colors.amber)),
-            ),
-            _PlaqueStud(
-              icon: Icons.undo,
-              enabled: widget.mode == 1 && !_inputLocked && engine.history.length >= 2,
-              onTap: _undo,
-            ),
-            const SizedBox(width: 8),
-            _PlaqueStud(icon: Icons.refresh, enabled: !_showGameOver, onTap: _restart),
-            const SizedBox(width: 8),
-            _PlaqueStud(
-              icon: _paused ? Icons.play_arrow : Icons.pause,
-              enabled: true,
-              onTap: _togglePause,
-            ),
-            const SizedBox(width: 8),
-            _PlaqueStud(
-              icon: Icons.settings,
-              enabled: true,
-              onTap: () {
-                audio.click();
-                widget.onOpenSettings();
-              },
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-
-  Widget _boardPanel() {
-    return Padding(
-      padding: const EdgeInsets.symmetric(horizontal: 16),
-      child: IronPanel(
-        padding: const EdgeInsets.fromLTRB(10, 10, 10, 12),
-        child: Column(
-          children: [
-            _selectorRow(),
-            const SizedBox(height: 8),
-            Expanded(child: _grid()),
-          ],
-        ),
-      ),
-    );
-  }
-
-  Widget _selectorRow() {
+  Widget _columnSelectors(F4ArcadeThemeDef theme, bool inputOpen) {
+    final turn = match.engine.turn;
+    final discColor = turn == 0 ? theme.redDisc : theme.amberDisc;
     return Row(
       children: [
-        for (var c = 0; c < 7; c++)
+        for (var c = 0; c < FourInARowEngine.cols; c++)
           Expanded(
-            child: Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 3),
-              child: _ColumnButton(
-                number: c + 1,
-                shaking: _shakeCol == c,
-                shakeCtl: _shakeCtl,
-                enabled: !_inputLocked && !_isBotTurn && engine.dropRow(c) != -1,
-                onTap: () => _tapColumn(c),
+            child: GestureDetector(
+              behavior: HitTestBehavior.opaque,
+              onTap: inputOpen ? () => match.humanDrop(c) : null,
+              child: AnimatedBuilder(
+                animation: _shakeCtl,
+                builder: (_, _) {
+                  final dx = _shakeCol == c
+                      ? 8 * (1 - _shakeCtl.value) * sin(_shakeCtl.value * 12)
+                      : 0.0;
+                  return Transform.translate(
+                    offset: Offset(dx, 0),
+                    child: Container(
+                      height: 52,
+                      margin: const EdgeInsets.symmetric(horizontal: 3),
+                      decoration: BoxDecoration(
+                        shape: BoxShape.circle,
+                        gradient: LinearGradient(
+                          begin: Alignment.topCenter,
+                          end: Alignment.bottomCenter,
+                          colors: inputOpen
+                              ? [
+                                  theme.accentLight,
+                                  theme.accent,
+                                  theme.accentDark
+                                ]
+                              : [
+                                  theme.accentDark.withValues(alpha: 0.5),
+                                  theme.accentDark.withValues(alpha: 0.35),
+                                  theme.accentDark.withValues(alpha: 0.25),
+                                ],
+                        ),
+                        boxShadow: [
+                          BoxShadow(
+                            color: Colors.black.withValues(alpha: 0.45),
+                            blurRadius: 6,
+                            offset: const Offset(0, 3),
+                          ),
+                        ],
+                      ),
+                      child: Container(
+                        margin: const EdgeInsets.all(5),
+                        decoration: BoxDecoration(
+                          shape: BoxShape.circle,
+                          color: theme.woodDeep,
+                        ),
+                        child: inputOpen
+                            ? Icon(Icons.arrow_drop_down,
+                                color: discColor, size: 26)
+                            : const SizedBox.shrink(),
+                      ),
+                    ),
+                  );
+                },
               ),
             ),
           ),
@@ -373,458 +374,274 @@ class _GameScreenState extends State<GameScreen>
     );
   }
 
-  Widget _grid() {
+  Widget _board(F4ArcadeThemeDef theme) {
     return LayoutBuilder(
       builder: (context, constraints) {
         final w = constraints.maxWidth;
-        final h = constraints.maxHeight;
-        final cellW = w / 7;
-        final cellH = h / 6;
-        final disc = min(cellW, cellH) * 0.88;
-        return Stack(
-          children: [
-            Column(
+        final cell = w / FourInARowEngine.cols;
+        final boardH = cell * FourInARowEngine.rows;
+        return F4BoardFrame(
+          theme: theme,
+          accentIndex: s.boardAccent,
+          child: SizedBox(
+            width: w,
+            height: boardH,
+            child: Stack(
               children: [
-                for (var r = 5; r >= 0; r--)
-                  Expanded(
-                    child: Row(
-                      children: [
-                        for (var c = 0; c < 7; c++)
-                          Expanded(child: Center(child: _cell(r, c, disc))),
-                      ],
+                // Grid cells (row 0 = bottom).
+                for (var r = 0; r < FourInARowEngine.rows; r++)
+                  for (var c = 0; c < FourInARowEngine.cols; c++)
+                    Positioned(
+                      left: c * cell,
+                      top: (FourInARowEngine.rows - 1 - r) * cell,
+                      width: cell,
+                      height: cell,
+                      child: GestureDetector(
+                        behavior: HitTestBehavior.opaque,
+                        onTap: () => match.humanDrop(c),
+                        child: Center(
+                          child: _cellContent(theme, r, c, cell),
+                        ),
+                      ),
                     ),
+                // Falling disc overlay.
+                if (match.animCol != -1)
+                  AnimatedBuilder(
+                    animation: _fallCtl,
+                    builder: (_, _) {
+                      final eased =
+                          Curves.easeIn.transform(_fallCtl.value.clamp(0.0, 1.0));
+                      final startY = -cell * 1.2;
+                      final endY =
+                          (FourInARowEngine.rows - 1 - match.animRow) * cell;
+                      final y = startY + (endY - startY) * eased;
+                      return Positioned(
+                        left: match.animCol * cell,
+                        top: y,
+                        width: cell,
+                        height: cell,
+                        child: Center(
+                          child: ThemedDisc(
+                            player: match.animPlayer,
+                            size: cell * 0.86,
+                            theme: theme,
+                            style: s.discStyle,
+                          ),
+                        ),
+                      );
+                    },
                   ),
               ],
             ),
-            // falling disc overlay
-            if (_animating)
-              AnimatedBuilder(
-                animation: _dropCtl,
-                builder: (context, _) {
-                  final targetY = (5 - _animRow) * cellH + (cellH - disc) / 2;
-                  const startY = -80.0;
-                  final y = startY + (targetY - startY) * Curves.bounceOut.transform(_dropCtl.value);
-                  return Positioned(
-                    left: _animCol * cellW + (cellW - disc) / 2,
-                    top: y,
-                    child: AcrylicDisc(player: _animPlayer, size: disc),
-                  );
-                },
-              ),
-            // winning line rail
-            if (engine.over && engine.winCells.isNotEmpty)
-              CustomPaint(
-                painter: _WinLinePainter(
-                  cells: engine.winCells,
-                  cellW: cellW,
-                  cellH: cellH,
-                ),
-                child: const SizedBox.expand(),
-              ),
-          ],
+          ),
         );
       },
     );
   }
 
-  Widget _cell(int r, int c, double disc) {
-    final owner = engine.cells[r * 7 + c];
-    final hidden = _animating && r == _animRow && c == _animCol;
-    if (owner == -1 || hidden) return BoardSlot(size: disc);
-    return AcrylicDisc(
-      player: owner,
-      size: disc,
-      highlight: engine.winCells.contains(r * 7 + c),
+  Widget _cellContent(
+      F4ArcadeThemeDef theme, int r, int c, double cell) {
+    final v = match.engine.cells[r * FourInARowEngine.cols + c];
+    final idx = r * FourInARowEngine.cols + c;
+    if (v == -1) {
+      return BoardSlot(size: cell * 0.86);
+    }
+    return Container(
+      decoration: BoxDecoration(
+        color: theme.felt.withValues(alpha: 0.35),
+        shape: BoxShape.circle,
+      ),
+      child: Center(
+        child: ThemedDisc(
+          player: v,
+          size: cell * 0.86,
+          theme: theme,
+          style: s.discStyle,
+          highlight: match.engine.winCells.contains(idx),
+        ),
+      ),
     );
   }
 
-  Widget _scorePlaque() {
+  Widget _scorePlaque(F4ArcadeThemeDef theme) {
     final m = widget.mode;
-    final left = m == 0 ? 'YOU' : 'RED';
-    final right = m == 0 ? 'BOT' : 'YEL';
-    return Padding(
-      padding: const EdgeInsets.symmetric(horizontal: 16),
-      child: IronPanel(
-        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
-        child: Row(
-          mainAxisAlignment: MainAxisAlignment.center,
-          children: [
-            Text('$left ${s.redWins[m]}', style: F4Text.mono(14, color: F4Colors.red)),
-            Text('  ·  ', style: F4Text.mono(14)),
-            Text('$right ${s.yellowWins[m]}', style: F4Text.mono(14, color: F4Colors.amber)),
-            Text('  ·  ', style: F4Text.mono(14)),
-            Text('DRAW ${s.draws[m]}', style: F4Text.mono(14)),
-            if (m == 0) ...[
-              const SizedBox(width: 12),
-              Container(
-                padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
-                decoration: BoxDecoration(
-                  color: F4Colors.cream,
-                  borderRadius: BorderRadius.circular(8),
-                  border: Border.all(color: F4Colors.chromeDark),
-                ),
-                child: Text(Bot.names[widget.difficulty], style: F4Text.monoDeboss(12)),
-              ),
-            ],
-          ],
-        ),
-      ),
-    );
-  }
-
-  // -- overlays ---------------------------------------------------------------
-  Widget _pauseOverlay() {
-    return _OverlayCard(
-      title: 'PAUSED',
-      children: [
-        ArcadeButton(
-          label: 'RESUME',
-          icon: Icons.play_arrow,
-          onPressed: _togglePause,
-        ),
-        const SizedBox(height: 12),
-        ArcadeButton(label: 'RESTART', icon: Icons.refresh, onPressed: _restart),
-        const SizedBox(height: 12),
-        ArcadeButton(
-          label: 'QUIT TO MENU',
-          icon: Icons.home_outlined,
-          onPressed: () {
-            audio.click();
-            widget.onExitToMenu();
-          },
-        ),
-      ],
-    );
-  }
-
-  Widget _gameOverOverlay() {
-    final draw = engine.isDraw;
-    final winner = engine.winner;
-    final title = draw
-        ? 'DRAW'
-        : winner == 0
-            ? (widget.mode == 0 ? 'YOU WIN' : 'RED WINS')
-            : (widget.mode == 0 ? 'BOT WINS' : 'YELLOW WINS');
-    final accent = draw ? F4Colors.cream : F4Colors.discBase(winner);
-    return Stack(
-      children: [
-        Confetti(active: !draw),
-        _OverlayCard(
-          title: title,
-          accent: accent,
-          children: [
-            if (!draw) ...[
-              const Trophy(size: 110),
-              const SizedBox(height: 8),
-            ],
-            Text(
-              draw
-                  ? 'Board\'s full — nobody blinked.'
-                  : widget.mode == 0 && winner == 1
-                      ? 'The bot takes this one. Run it back?'
-                      : 'Four in a row. Zero mercy.',
-              textAlign: TextAlign.center,
-              style: F4Text.body,
-            ),
-            const SizedBox(height: 16),
-            ArcadeButton(
-              label: 'REMATCH',
-              icon: Icons.refresh,
-              onPressed: _restart,
-            ),
-            const SizedBox(height: 12),
-            ArcadeButton(
-              label: 'CHANGE MODE',
-              icon: Icons.swap_horiz,
-              onPressed: () {
-                audio.click();
-                widget.onExitToMenu();
-              },
-            ),
-            const SizedBox(height: 12),
-            ArcadeButton(
-              label: 'MAIN MENU',
-              icon: Icons.home_outlined,
-              onPressed: () {
-                audio.click();
-                widget.onExitToMenu();
-              },
-            ),
-          ],
-        ),
-      ],
-    );
-  }
-}
-
-/// Small chrome stud for the status plaque.
-class _PlaqueStud extends StatefulWidget {
-  final IconData icon;
-  final bool enabled;
-  final VoidCallback onTap;
-  const _PlaqueStud({required this.icon, required this.enabled, required this.onTap});
-
-  @override
-  State<_PlaqueStud> createState() => _PlaqueStudState();
-}
-
-class _PlaqueStudState extends State<_PlaqueStud> {
-  bool _down = false;
-  @override
-  Widget build(BuildContext context) {
-    return GestureDetector(
-      onTapDown: (_) => setState(() => _down = true),
-      onTapUp: (_) {
-        setState(() => _down = false);
-        if (widget.enabled) widget.onTap();
-      },
-      onTapCancel: () => setState(() => _down = false),
-      child: AnimatedContainer(
-        duration: const Duration(milliseconds: 70),
-        width: 44,
-        height: 44,
-        margin: EdgeInsets.only(top: _down ? 2 : 0),
-        decoration: BoxDecoration(
-          shape: BoxShape.circle,
-          gradient: LinearGradient(
-            begin: Alignment.topCenter,
-            end: Alignment.bottomCenter,
-            colors: widget.enabled
-                ? const [F4Colors.chromeLight, F4Colors.chrome, F4Colors.chromeDark]
-                : const [Color(0xFF4A4D52), Color(0xFF3A3D41), Color(0xFF2A2D30)],
-          ),
-          border: Border.all(color: const Color(0xFF3A3D41), width: 1.5),
-          boxShadow: _down || !widget.enabled
-              ? const []
-              : [
-                  BoxShadow(color: Colors.black.withValues(alpha: 0.5), blurRadius: 5, offset: const Offset(0, 2)),
-                ],
-        ),
-        child: Icon(
-          widget.icon,
-          color: widget.enabled ? F4Colors.deboss : const Color(0xFF222222),
-          size: 22,
-        ),
-      ),
-    );
-  }
-}
-
-/// Chrome column-selector button with press + shake feedback.
-class _ColumnButton extends StatefulWidget {
-  final int number;
-  final bool enabled;
-  final bool shaking;
-  final AnimationController shakeCtl;
-  final VoidCallback onTap;
-  const _ColumnButton({
-    required this.number,
-    required this.enabled,
-    required this.shaking,
-    required this.shakeCtl,
-    required this.onTap,
-  });
-
-  @override
-  State<_ColumnButton> createState() => _ColumnButtonState();
-}
-
-class _ColumnButtonState extends State<_ColumnButton> {
-  bool _down = false;
-  @override
-  Widget build(BuildContext context) {
-    final anim = widget.shaking
-        ? TweenSequence<double>([
-            TweenSequenceItem(tween: Tween(begin: 0, end: -8), weight: 1),
-            TweenSequenceItem(tween: Tween(begin: -8, end: 8), weight: 2),
-            TweenSequenceItem(tween: Tween(begin: 8, end: 0), weight: 1),
-          ]).animate(widget.shakeCtl)
-        : null;
-    final btn = GestureDetector(
-      onTapDown: (_) => setState(() => _down = true),
-      onTapUp: (_) {
-        setState(() => _down = false);
-        if (widget.enabled) widget.onTap();
-      },
-      onTapCancel: () => setState(() => _down = false),
-      child: AnimatedContainer(
-        duration: const Duration(milliseconds: 70),
-        height: 46,
-        margin: EdgeInsets.only(top: _down ? 3 : 0),
-        decoration: BoxDecoration(
-          shape: BoxShape.circle,
-          gradient: LinearGradient(
-            begin: Alignment.topCenter,
-            end: Alignment.bottomCenter,
-            colors: widget.enabled
-                ? const [F4Colors.chromeLight, F4Colors.chrome, F4Colors.chromeDark]
-                : const [Color(0xFF4A4D52), Color(0xFF35383C), Color(0xFF26282B)],
-          ),
-          border: Border.all(color: const Color(0xFF3A3D41), width: 1.5),
-          boxShadow: _down || !widget.enabled
-              ? const []
-              : [
-                  BoxShadow(color: Colors.black.withValues(alpha: 0.5), blurRadius: 5, offset: const Offset(0, 3)),
-                ],
-        ),
-        alignment: Alignment.center,
-        child: Text(
-          '${widget.number}',
-          style: F4Text.mono(
-            17,
-            color: widget.enabled ? F4Colors.deboss : const Color(0xFF1B1B1B),
-          ),
-        ),
-      ),
-    );
-    if (anim == null) return btn;
-    return AnimatedBuilder(
-      animation: anim,
-      builder: (context, _) => Transform.translate(
-        offset: Offset(anim.value, 0),
-        child: btn,
-      ),
-    );
-  }
-}
-
-/// Animated "thinking" dots for the bot turn.
-class _ThinkingDots extends StatefulWidget {
-  const _ThinkingDots();
-  @override
-  State<_ThinkingDots> createState() => _ThinkingDotsState();
-}
-
-class _ThinkingDotsState extends State<_ThinkingDots>
-    with SingleTickerProviderStateMixin {
-  late final AnimationController _ctl;
-  @override
-  void initState() {
-    super.initState();
-    _ctl = AnimationController(vsync: this, duration: const Duration(milliseconds: 900))..repeat();
-  }
-
-  @override
-  void dispose() {
-    _ctl.dispose();
-    super.dispose();
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return AnimatedBuilder(
-      animation: _ctl,
-      builder: (context, _) => Row(
+    return IronPanel(
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+      child: Row(
+        mainAxisAlignment: MainAxisAlignment.spaceAround,
         children: [
-          Text('BOT THINKING', style: F4Text.mono(15, color: F4Colors.amber)),
-          const SizedBox(width: 6),
-          for (var i = 0; i < 3; i++)
-            Padding(
-              padding: const EdgeInsets.only(right: 3),
-              child: Opacity(
-                opacity: ((_ctl.value * 3 - i * 0.5).clamp(0.0, 1.0) * 0.8 + 0.2),
-                child: Container(
-                  width: 7,
-                  height: 7,
-                  decoration: const BoxDecoration(
-                    shape: BoxShape.circle,
-                    color: F4Colors.amber,
-                  ),
-                ),
-              ),
-            ),
+          _scoreCell(theme, s.playerNames[0], '${s.wins0[m]}', theme.redDisc),
+          _scoreCell(theme, 'DRAWS', '${s.draws[m]}', theme.ivory),
+          _scoreCell(theme, s.playerNames[1], '${s.wins1[m]}', theme.amberDisc),
         ],
       ),
     );
   }
-}
 
-/// Brass pointer rail drawn through the winning cells.
-class _WinLinePainter extends CustomPainter {
-  final Set<int> cells;
-  final double cellW, cellH;
-  _WinLinePainter({required this.cells, required this.cellW, required this.cellH});
-
-  @override
-  void paint(Canvas canvas, Size size) {
-    if (cells.length < 2) return;
-    Offset centerOf(int i) {
-      final r = i ~/ 7, c = i % 7;
-      return Offset(c * cellW + cellW / 2, (5 - r) * cellH + cellH / 2);
-    }
-    // endpoints = the two cells farthest apart
-    var a = cells.first, b = cells.first;
-    var best = -1.0;
-    final list = cells.toList();
-    for (var i = 0; i < list.length; i++) {
-      for (var j = i + 1; j < list.length; j++) {
-        final d = (centerOf(list[i]) - centerOf(list[j])).distanceSquared;
-        if (d > best) {
-          best = d;
-          a = list[i];
-          b = list[j];
-        }
-      }
-    }
-    final p1 = centerOf(a), p2 = centerOf(b);
-    final dir = (p2 - p1);
-    final ext = dir / dir.distance * (cellW * 0.35);
-    for (final (width, color) in [
-      (12.0, const Color(0xFF5A3600)),
-      (8.0, F4Colors.gold),
-    ]) {
-      canvas.drawLine(
-        p1 - ext,
-        p2 + ext,
-        Paint()
-          ..color = color
-          ..strokeWidth = width
-          ..strokeCap = StrokeCap.round,
-      );
-    }
+  Widget _scoreCell(
+      F4ArcadeThemeDef theme, String label, String value, Color color) {
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Text(value,
+            style: F4Text.mono(20, color: color)),
+        Text(label,
+            style: F4Text.mono(10, color: theme.ivory.withValues(alpha: 0.6)),
+            overflow: TextOverflow.ellipsis),
+      ],
+    );
   }
 
-  @override
-  bool shouldRepaint(covariant _WinLinePainter old) => old.cells != cells;
+  Widget _pauseOverlay(F4ArcadeThemeDef theme) {
+    return Container(
+      color: Colors.black.withValues(alpha: 0.7),
+      child: Center(
+        child: IronPanel(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Text('PAUSED', style: F4Text.headline(28, color: theme.ivory)),
+              const SizedBox(height: 18),
+              ArcadeButton(
+                label: 'RESUME',
+                width: 220,
+                height: 56,
+                fontSize: 15,
+                onPressed: () {
+                  widget.audio.click();
+                  match.setPaused(false);
+                },
+              ),
+              const SizedBox(height: 10),
+              ArcadeButton(
+                label: 'QUIT TO MENU',
+                width: 220,
+                height: 56,
+                fontSize: 15,
+                onPressed: () {
+                  widget.audio.click();
+                  Navigator.of(context).pop();
+                },
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _gameOverOverlay(F4ArcadeThemeDef theme) {
+    final eng = match.engine;
+    final isDraw = eng.winner < 0;
+    final winnerName = isDraw ? null : match.sideName(eng.winner);
+    return Stack(
+      children: [
+        // Paper confetti rains over the whole overlay.
+        const Positioned.fill(child: Confetti(active: true)),
+        Container(
+          color: Colors.black.withValues(alpha: 0.55),
+          child: Center(
+            child: SingleChildScrollView(
+              padding: const EdgeInsets.all(24),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  ChromePlaque(
+                    text: isDraw ? "IT'S A DRAW" : '$winnerName WINS',
+                    fontSize: 26,
+                    accent: theme.accentDark,
+                  ),
+                  const SizedBox(height: 14),
+                  if (!isDraw) ...[
+                    const Trophy(size: 110),
+                    const SizedBox(height: 10),
+                  ],
+                  Text(
+                    match.banner,
+                    style: F4Text.body.copyWith(
+                        color: theme.ivory.withValues(alpha: 0.85)),
+                    textAlign: TextAlign.center,
+                  ),
+                  const SizedBox(height: 18),
+                  ArcadeButton(
+                    label: 'REMATCH',
+                    icon: Icons.refresh,
+                    width: 240,
+                    onPressed: () {
+                      widget.audio.click();
+                      match.newGame();
+                    },
+                  ),
+                  const SizedBox(height: 10),
+                  ArcadeButton(
+                    label: 'MAIN MENU',
+                    icon: Icons.home,
+                    width: 240,
+                    onPressed: () {
+                      widget.audio.click();
+                      Navigator.of(context).pop();
+                    },
+                  ),
+                  const SizedBox(height: 16),
+                  _scorePlaque(theme),
+                ],
+              ),
+            ),
+          ),
+        ),
+      ],
+    );
+  }
 }
 
-/// Dimmed backdrop + centered plaque card for pause / game-over.
-class _OverlayCard extends StatelessWidget {
-  final String title;
-  final Color accent;
-  final List<Widget> children;
-  const _OverlayCard({
-    required this.title,
-    required this.children,
-    this.accent = F4Colors.cream,
+class _IconStud extends StatelessWidget {
+  final IconData icon;
+  final F4ArcadeThemeDef theme;
+  final bool enabled;
+  final VoidCallback onTap;
+  const _IconStud({
+    required this.icon,
+    required this.theme,
+    required this.enabled,
+    required this.onTap,
   });
 
   @override
   Widget build(BuildContext context) {
-    return Positioned.fill(
-      child: Container(
-        color: Colors.black.withValues(alpha: 0.62),
-        child: Center(
-          child: SingleChildScrollView(
-            padding: const EdgeInsets.all(24),
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                ChromePlaque(text: title, fontSize: 26, accent: accent == F4Colors.cream ? null : accent),
-                const SizedBox(height: 16),
-                ConstrainedBox(
-                  constraints: const BoxConstraints(maxWidth: 380),
-                  child: IronPanel(
-                    padding: const EdgeInsets.all(18),
-                    child: Column(
-                      mainAxisSize: MainAxisSize.min,
-                      crossAxisAlignment: CrossAxisAlignment.stretch,
-                      children: children,
-                    ),
-                  ),
-                ),
-              ],
+    return GestureDetector(
+      onTap: enabled
+          ? () {
+              HapticFeedback.lightImpact();
+              onTap();
+            }
+          : null,
+      child: Opacity(
+        opacity: enabled ? 1.0 : 0.35,
+        child: Container(
+          width: 46,
+          height: 46,
+          decoration: BoxDecoration(
+            shape: BoxShape.circle,
+            gradient: LinearGradient(
+              begin: Alignment.topCenter,
+              end: Alignment.bottomCenter,
+              colors: [theme.accentLight, theme.accent, theme.accentDark],
             ),
+            boxShadow: [
+              BoxShadow(
+                color: Colors.black.withValues(alpha: 0.45),
+                blurRadius: 6,
+                offset: const Offset(0, 3),
+              ),
+            ],
+          ),
+          child: Container(
+            margin: const EdgeInsets.all(4),
+            decoration: BoxDecoration(
+              shape: BoxShape.circle,
+              color: theme.woodDeep,
+            ),
+            child: Icon(icon, color: theme.accentLight, size: 20),
           ),
         ),
       ),

@@ -1,12 +1,11 @@
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
-import 'audio.dart';
-import 'screens/game_screen.dart';
-import 'screens/menu_screen.dart';
-import 'screens/settings_screen.dart';
-import 'settings.dart';
-import 'theme.dart';
+import 'screens/splash_screen.dart';
+import 'services/audio_service.dart';
+import 'services/iap_service.dart';
+import 'services/settings_service.dart';
+import 'theme/arcade_themes.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -14,138 +13,88 @@ void main() async {
     DeviceOrientation.portraitUp,
     DeviceOrientation.portraitDown,
   ]);
-  await F4Settings.instance.init();
-  await F4Audio.instance.init();
-  runApp(const FourInARowApp());
+  final settings = F4Settings();
+  await settings.load();
+  final audio = F4Audio();
+  audio.configure(
+    musicOn: settings.musicOn,
+    sfxOn: settings.sfxOn,
+    masterVol: settings.masterVol,
+    musicVol: settings.musicVol,
+  );
+  final store = F4Store();
+  await store.init();
+  runApp(FourInARowApp(settings: settings, audio: audio, store: store));
 }
 
-enum _Screen { menu, game, settings }
-
 class FourInARowApp extends StatefulWidget {
-  const FourInARowApp({super.key});
+  final F4Settings settings;
+  final F4Audio audio;
+  final F4Store store;
+  const FourInARowApp({
+    super.key,
+    required this.settings,
+    required this.audio,
+    required this.store,
+  });
 
   @override
   State<FourInARowApp> createState() => _FourInARowAppState();
 }
 
-class _FourInARowAppState extends State<FourInARowApp> {
-  _Screen _screen = _Screen.menu;
-  _Screen _settingsReturn = _Screen.menu;
-  GameScreen? _game; // retained while settings is pushed over a live game
-  Map<String, dynamic>? _save;
-  bool _saveChecked = false;
-
-  final audio = F4Audio.instance;
-  final s = F4Settings.instance;
-
+class _FourInARowAppState extends State<FourInARowApp>
+    with WidgetsBindingObserver {
   @override
   void initState() {
     super.initState();
-    audio.playMusic('audio/music_menu.wav');
-    _checkSave();
+    WidgetsBinding.instance.addObserver(this);
   }
 
-  Future<void> _checkSave() async {
-    final save = await GameScreen.loadSave();
-    if (mounted) {
-      setState(() {
-        _save = save;
-        _saveChecked = true;
-      });
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    widget.audio.dispose();
+    widget.store.dispose();
+    super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    // Pause (not stop) on interruption so music resumes exactly where it
+    // left off; game screens additionally freeze their engines.
+    if (state == AppLifecycleState.paused ||
+        state == AppLifecycleState.inactive) {
+      widget.audio.onAppPaused();
+    } else if (state == AppLifecycleState.resumed) {
+      widget.audio.onAppResumed();
     }
-  }
-
-  void _goMenu() {
-    _game = null;
-    setState(() {
-      _screen = _Screen.menu;
-      _saveChecked = false;
-    });
-    audio.playMusic('audio/music_menu.wav');
-    _checkSave();
-  }
-
-  void _startGame({required int mode, Map<String, dynamic>? restored}) {
-    setState(() {
-      _game = GameScreen(
-        key: ValueKey('game-$mode-${DateTime.now().millisecondsSinceEpoch}'),
-        mode: mode,
-        difficulty: s.difficulty,
-        restored: restored,
-        onExitToMenu: _goMenu,
-        onOpenSettings: () {
-          _settingsReturn = _Screen.game;
-          setState(() => _screen = _Screen.settings);
-        },
-      );
-      _screen = _Screen.game;
-    });
-    audio.playMusic('audio/music_game.wav');
-  }
-
-  void _openSettings() {
-    _settingsReturn = _Screen.menu;
-    setState(() => _screen = _Screen.settings);
-    audio.click();
   }
 
   @override
   Widget build(BuildContext context) {
-    return MaterialApp(
-      title: 'Four in a Row',
-      debugShowCheckedModeBanner: false,
-      theme: ThemeData(
-        scaffoldBackgroundColor: F4Colors.walnut,
-        colorScheme: ColorScheme.dark(
-          primary: F4Colors.amber,
-          surface: F4Colors.chassis,
-        ),
-        useMaterial3: true,
-      ),
-      home: Scaffold(
-        body: WalnutBackground(
-          child: AnimatedSwitcher(
-            duration: const Duration(milliseconds: 250),
-            child: _currentScreen(),
+    return ListenableBuilder(
+      listenable: widget.settings,
+      builder: (_, _) {
+        final theme = F4ArcadeThemes.byId(widget.settings.themeId,
+            custom: widget.settings.customTheme);
+        return MaterialApp(
+          title: 'Four in a Row',
+          debugShowCheckedModeBanner: false,
+          theme: ThemeData(
+            scaffoldBackgroundColor: theme.woodDeep,
+            colorScheme: ColorScheme.dark(
+              primary: theme.accent,
+              surface: theme.woodMid,
+            ),
+            useMaterial3: true,
           ),
-        ),
-      ),
+          home: SplashScreen(
+            audio: widget.audio,
+            settings: widget.settings,
+            store: widget.store,
+          ),
+        );
+      },
     );
-  }
-
-  Widget _currentScreen() {
-    switch (_screen) {
-      case _Screen.menu:
-        return MenuScreen(
-          key: const ValueKey('menu'),
-          hasSave: _saveChecked && _save != null,
-          onPlayBot: () => _startGame(mode: 0),
-          onPlay2P: () => _startGame(mode: 1),
-          onOpenSettings: _openSettings,
-          onResume: () {
-            final save = _save;
-            if (save == null) return;
-            _startGame(
-              mode: save['mode'] as int,
-              restored: save,
-            );
-          },
-        );
-      case _Screen.game:
-        return _game ?? const SizedBox.shrink(key: ValueKey('empty'));
-      case _Screen.settings:
-        return SettingsScreen(
-          key: const ValueKey('settings'),
-          onBack: () {
-            audio.click();
-            setState(() => _screen = _settingsReturn);
-            if (_settingsReturn == _Screen.menu) {
-              audio.playMusic('audio/music_menu.wav');
-            } else {
-              audio.playMusic('audio/music_game.wav');
-            }
-          },
-        );
-    }
   }
 }

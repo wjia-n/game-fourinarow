@@ -34,6 +34,28 @@ class Bot {
     }
   }
 
+  /// Synchronous Easy choice — used by headless bot-vs-bot simulations
+  /// and unit tests (no isolate, no async).
+  static int chooseEasy(List<int> cells, int side) =>
+      _chooseEasy(cells, side);
+
+  /// Synchronous Medium choice — used by headless bot-vs-bot simulations
+  /// and unit tests (no isolate, no async).
+  static int chooseMedium(List<int> cells, int side) =>
+      _chooseMedium(cells, side);
+
+  /// Synchronous Hard choice with a custom time budget (ms) — test hook so
+  /// the sim can run Hard brains without a multi-second isolate budget.
+  static int chooseHardSync(List<int> cells, int side, {int budgetMs = 400}) {
+    final args = <String, dynamic>{
+      'cells': List<int>.from(cells),
+      'side': side,
+      'budgetMs': budgetMs,
+      'seed': DateTime.now().millisecondsSinceEpoch,
+    };
+    return _hardSearch(args);
+  }
+
   // -- Easy ---------------------------------------------------------------
   static int _chooseEasy(List<int> cells, int side) {
     final rand = Random();
