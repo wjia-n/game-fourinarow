@@ -65,7 +65,7 @@ class F4Settings extends ChangeNotifier {
   String themeId = 'walnut';
   int discStyle = 0;
   int boardAccent = 0;
-  bool isPro = false;
+  bool isPro = true; // everything unlocked — no Pro version
 
   /// Which side opened the last match (0 = Red, 1 = Yellow). Next match
   /// opens with the other side (RULES.md §3 + opening-player alternation).
@@ -140,7 +140,7 @@ class F4Settings extends ChangeNotifier {
     discStyle = (p.getInt(_kDiscStyle) ?? 0).clamp(0, DiscStyles.names.length - 1);
     boardAccent =
         (p.getInt(_kBoardAccent) ?? 0).clamp(0, BoardAccents.names.length - 1);
-    isPro = p.getBool(_kIsPro) ?? false;
+    isPro = true; // everything unlocked
     lastStarter = (p.getInt(_kLastStarter) ?? 1).clamp(0, 1);
     for (var m = 0; m < 2; m++) {
       matches[m] = p.getInt('$_kMatches$m') ?? 0;
